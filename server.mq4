@@ -21,17 +21,20 @@ extern int     MagicNumber       = 123456;
 extern int     MaximumOrders     = 1;
 extern double  MaximumLotSize    = 0.01;
 extern bool    Blocking          = false;
+extern int     Slippage          = 3;
 
 Context  context     (PROJECT_NAME);
 Socket   repSocket   (context,ZMQ_REP);
 Socket   pushSocket  (context,ZMQ_PUSH);
 
-int     signal;
-uchar   data[];
-ZmqMsg  request;
+int      signal, Ticket, OP;
+uchar    bytes[];
+ZmqMsg   request;
+double   StopLossLevel, TakeProfitLevel;
+string   info, operation;
 
 //+------------------------------------------------------------------+
-//| Expert initialization function                                   |
+//| Expert initialization function overload                          |
 //+------------------------------------------------------------------+
 int OnInit()
     {
@@ -53,19 +56,19 @@ int OnInit()
     }
   
 //+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
+//| Expert deinitialization function overload                        |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-  Print("[REP] Unbinding MT4 Server from Socket on Port " + REP_PORT + "..");
+  Print(StringFormat("[REP] Unbinding MT4 Server from Socket on Port %d..", REP_PORT));
   repSocket.unbind(StringFormat("%s://%s:%d", ZEROMQ_PROTOCOL, HOSTNAME, REP_PORT));
    
-  Print("[PUSH] Unbinding MT4 Server from Socket on Port " + PUSH_PORT + "..");
+  Print(StringFormat("[PUSH] Unbinding MT4 Server from Socket on Port %d..", PUSH_PORT));
   pushSocket.unbind(StringFormat("%s://%s:%d", ZEROMQ_PROTOCOL, HOSTNAME, PUSH_PORT));
 }
 
 //+------------------------------------------------------------------+
-//| Expert timer function                                            |
+//| Expert timer function overload                                   |
 //+------------------------------------------------------------------+
 void OnTimer()
 {  
@@ -79,7 +82,7 @@ void OnTimer()
    repSocket.send(reply);
 }
 
-ZmqMsg MessageHandler(ZmqMsg &request) {
+ZmqMsg MessageHandler(ZmqMsg &req) {
    
    // Output object
    ZmqMsg reply;
@@ -87,14 +90,14 @@ ZmqMsg MessageHandler(ZmqMsg &request) {
    // Message components for later.
    string components[];
    
-   if(request.size() > 0) {
+   if(req.size() > 0) {
    
-      // Resize Data Array to request's size 
-      ArrayResize(data, request.size());
-      // Store data from request in Data Array
-      request.getData(data);
-      // Convert Data Array to Data String
-      string dataStr = CharArrayToString(data);
+      // Resize Bytes Array to request's size 
+      ArrayResize(bytes, req.size());
+      // Store bytes from request in Bytes Array
+      req.getData(bytes);
+      // Convert Bytes Array to Data String
+      string dataStr = CharArrayToString(bytes);
       
       // Parse data from Data String to Components Array
       ParseZmqMessage(dataStr, components);
@@ -137,12 +140,42 @@ void InterpretZmqMessage(Socket &pSocket, string& compArray[]) {
    ArraySetAsSeries(price_array, true);
    
    int price_count = 0;
+   double value = NULL;
    
    switch(switch_action) 
    {
       case 1: 
          InformPullClient(pSocket, "OPEN TRADE Instruction Received");
-         // TODO OPEN TRADE LOGIC
+         info = "";
+         OP = StrToInteger(compArray[2]);
+         
+         if(OP == 0){
+            StopLossLevel = Ask - StrToDouble(compArray[4]) * Point;
+            TakeProfitLevel = Ask + StrToDouble(compArray[5]) * Point;
+            operation = "BUY";
+            value = Ask;
+         }
+         else if(OP == 1){
+            StopLossLevel = Bid + StrToDouble(compArray[4]) * Point;
+            TakeProfitLevel = Bid - StrToDouble(compArray[5]) * Point;
+            operation = "SELL";
+            value = Bid;
+         }
+         
+         Ticket = OrderSend(compArray[3], OP, MaximumLotSize, value, Slippage, StopLossLevel, TakeProfitLevel, StringFormat("%s order: %d", operation, MagicNumber), MagicNumber, 0, clrGreen);
+            
+         if(Ticket >= 0){
+            if(OrderSelect(Ticket, SELECT_BY_TICKET, MODE_TRADES)){
+               info = StringFormat("SELL order opened : %d", OrderOpenPrice());
+            } else {
+               info = StringFormat("OrderSend failed: %s", GetLastError());
+            }
+         } else {
+            info = StringFormat("Ticket not sent: %s", GetLastError())
+         }
+         Print(info);
+         InformPullClient(pSocket, info);
+         
          break;
       case 2: 
          ret = "N/A"; 
@@ -153,8 +186,8 @@ void InterpretZmqMessage(Socket &pSocket, string& compArray[]) {
          break;
       case 3:
          InformPullClient(pSocket, "CLOSE TRADE Instruction Received");
-         
-         // IMPLEMENT CLOSE TRADE LOGIC HERE
+
+         // TODO CLOSE TRADE LOGIC
          
          ret = StringFormat("Trade Closed (Ticket: %d)", ticket);
          InformPullClient(pSocket, ret);
@@ -185,7 +218,7 @@ void InterpretZmqMessage(Socket &pSocket, string& compArray[]) {
             
             Print("Sending: " + ret);
             
-            // Send data to PULL client.
+            // Send bytes to PULL client.
             InformPullClient(pSocket, StringFormat("%s", ret));
             // ret = "";
          }
@@ -208,7 +241,7 @@ void ParseZmqMessage(string& message, string& retArray[]) {
    int splits = StringSplit(message, u_sep, retArray);
    
    for(int i = 0; i < splits; i++) {
-      Print(i + ") " + retArray[i]);
+      Print(StringFormat("%d) %s", i, retArray[i]));
    }
 }
 
@@ -222,11 +255,10 @@ string GetBidAsk(string symbol) {
    return(StringFormat("%f|%f", bid, ask));
 }
 
-// Inform Client
-void InformPullClient(Socket& pushSocket, string message) {
+// Inform Client via push socket
+void InformPullClient(Socket& pushSoc, string message) {
 
    ZmqMsg pushReply(StringFormat("[SERVER]: %s", message));
    
-   pushSocket.send(pushReply, Blocking);
-   
+   pushSoc.send(pushReply, Blocking);
 }
